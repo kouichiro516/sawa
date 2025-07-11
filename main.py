@@ -37,7 +37,7 @@ def setup_logging() -> None:
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('sales_processor.log', encoding='utf-8'),
+            logging.FileHandler(LOG_FILE, encoding='utf-8'),
             logging.StreamHandler()
         ]
     )
@@ -97,6 +97,7 @@ COL_SALES_AMOUNT = config['columns']['sales_amount']
 COL_GROUP_NAME = config['columns']['group_name']
 COL_GROUP_LABEL = config['columns']['group_label']
 COL_TOTAL_LABEL = config['columns']['total_label']
+COL_TOTAL_SALES = config['columns']['total_sales']
 
 # シート名
 SHEET_CONCAT = config['sheets']['concat']
@@ -195,8 +196,8 @@ def load_and_preprocess_data() -> List[pd.DataFrame]:
                 g = pd.to_numeric(df.iloc[:, 6], errors='coerce')
                 df.iloc[:, 10] = k - g
             df = df.iloc[:, [0, 1, 10]]
-            df.columns = ['得意先CD', '得意先', '今回請求額']
-            df['今回請求額'] = pd.to_numeric(df['今回請求額'], errors='coerce')
+            df.columns = [COL_CUSTOMER_CODE, COL_CUSTOMER_NAME, COL_SALES_AMOUNT]
+            df[COL_SALES_AMOUNT] = pd.to_numeric(df[COL_SALES_AMOUNT], errors='coerce')
             all_list.append(df)
             logger.info(f"ファイル処理完了: {file} (行数: {len(df)})")
         except Exception as e:
@@ -227,17 +228,18 @@ def merge_with_master(all_df: pd.DataFrame) -> pd.DataFrame:
         raise DataValidationError("マスタファイルの列数が不足しています（最低2列必要）")
     
     master_df = master_df.iloc[:, :2]
-    master_df.columns = ['所属グループ', '得意先']
-    all_df['得意先'] = all_df['得意先'].str.replace(' ', '').str.replace('　', '')
-    master_df['得意先'] = master_df['得意先'].str.replace(' ', '').str.replace('　', '')
+    master_df.columns = [COL_GROUP_NAME, COL_CUSTOMER_NAME]
+    # 全角・半角空白削除で結合精度UP
+    all_df[COL_CUSTOMER_NAME] = all_df[COL_CUSTOMER_NAME].str.replace(' ', '').str.replace('　', '')
+    master_df[COL_CUSTOMER_NAME] = master_df[COL_CUSTOMER_NAME].str.replace(' ', '').str.replace('　', '')
     
-    merged_df = all_df.merge(master_df, how='left', on='得意先')
-    merged_df = merged_df[['得意先CD', '得意先', '今回請求額', '所属グループ']]
-    merged_df['今回請求額'] = pd.to_numeric(merged_df['今回請求額'], errors='coerce')
-    merged_df = merged_df.sort_values(by='今回請求額', ascending=False)
+    merged_df = all_df.merge(master_df, how='left', on=COL_CUSTOMER_NAME)
+    merged_df = merged_df[[COL_CUSTOMER_CODE, COL_CUSTOMER_NAME, COL_SALES_AMOUNT, COL_GROUP_NAME]]
+    merged_df[COL_SALES_AMOUNT] = pd.to_numeric(merged_df[COL_SALES_AMOUNT], errors='coerce')
+    merged_df = merged_df.sort_values(by=COL_SALES_AMOUNT, ascending=False)
     
     # グループ未設定のデータ数をチェック
-    unknown_groups = merged_df['所属グループ'].isna().sum()
+    unknown_groups = merged_df[COL_GROUP_NAME].isna().sum()
     if unknown_groups > 0:
         logger.warning(f"グループ未設定のデータ: {unknown_groups}件")
     
@@ -266,7 +268,7 @@ def format_concat_sheet_colors(ws: Worksheet, all_df: pd.DataFrame) -> None:
     """連結シートでグループ名が不明な行を薄い赤色で色付け"""
     red_fill = PatternFill(start_color=COLOR_UNKNOWN_GROUP, end_color=COLOR_UNKNOWN_GROUP, fill_type='solid')
     for i, (idx, row) in enumerate(all_df.iterrows(), 2):
-        group_value = row['所属グループ']
+        group_value = row[COL_GROUP_NAME]
         is_unknown = False
         if pd.isna(group_value):
             is_unknown = True
@@ -282,24 +284,24 @@ def format_concat_sheet_colors(ws: Worksheet, all_df: pd.DataFrame) -> None:
 
 def save_group_summary(all_df: pd.DataFrame) -> pd.DataFrame:
     """グループごとの合計売上を当月売上シートに出力"""
-    group_sum = all_df.groupby('所属グループ', dropna=False)['今回請求額'].sum().reset_index()
-    group_sum = group_sum.rename(columns={'所属グループ': 'グループ名', '今回請求額': '合計売上'})
-    group_sum = group_sum.sort_values('合計売上', ascending=False)
-    total = group_sum['合計売上'].sum()
-    total_row = pd.DataFrame({'グループ名': ['合計'], '合計売上': [total]})
+    group_sum = all_df.groupby(COL_GROUP_NAME, dropna=False)[COL_SALES_AMOUNT].sum().reset_index()
+    group_sum = group_sum.rename(columns={COL_GROUP_NAME: COL_GROUP_LABEL, COL_SALES_AMOUNT: COL_TOTAL_SALES})
+    group_sum = group_sum.sort_values(COL_TOTAL_SALES, ascending=False)
+    total = group_sum[COL_TOTAL_SALES].sum()
+    total_row = pd.DataFrame({COL_GROUP_LABEL: [COL_TOTAL_LABEL], COL_TOTAL_SALES: [total]})
     group_sum = pd.concat([group_sum, total_row], ignore_index=True)
-    group_sum['合計売上'] = pd.to_numeric(group_sum['合計売上'], errors='coerce')
+    group_sum[COL_TOTAL_SALES] = pd.to_numeric(group_sum[COL_TOTAL_SALES], errors='coerce')
     with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
         group_sum.to_excel(writer, index=False, sheet_name=YYMM)
     return group_sum
 
 def save_company_sheet(all_df: pd.DataFrame, group_sum: pd.DataFrame) -> None:
     """会社別シートをグループ売上順で出力"""
-    group_order = group_sum[group_sum['グループ名'] != '合計']['グループ名'].tolist()
+    group_order = group_sum[group_sum[COL_GROUP_LABEL] != COL_TOTAL_LABEL][COL_GROUP_LABEL].tolist()
     group_rank = {g: i for i, g in enumerate(group_order)}
-    all_df['グループ売上順位'] = all_df['所属グループ'].map(group_rank).fillna(len(group_order))
-    all_df_sorted = all_df.sort_values(['グループ売上順位', '今回請求額'], ascending=[True, False])
-    all_df_sorted['今回請求額'] = pd.to_numeric(all_df_sorted['今回請求額'], errors='coerce')
+    all_df['グループ売上順位'] = all_df[COL_GROUP_NAME].map(group_rank).fillna(len(group_order))
+    all_df_sorted = all_df.sort_values(['グループ売上順位', COL_SALES_AMOUNT], ascending=[True, False])
+    all_df_sorted[COL_SALES_AMOUNT] = pd.to_numeric(all_df_sorted[COL_SALES_AMOUNT], errors='coerce')
     with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
         all_df_sorted.drop(columns=['グループ売上順位']).to_excel(writer, index=False, sheet_name=SHEET_COMPANY)
 
@@ -365,8 +367,8 @@ def process_dispersion_sheet() -> None:
     if data_count > 1:
         ws.insert_rows(3, data_count - 1)
     for i in range(1, data_count):
-        for col, tmpl_cell in enumerate(template_row, 1):
-            copy_cell(tmpl_cell, ws.cell(row=2 + i, column=col))
+        for col in range(1, ws.max_column + 1):
+            copy_cell(template_row[col-1], ws.cell(row=2 + i, column=col))
     sum_row_idx = 2 + data_count
     for col, sum_tmpl_cell in enumerate(sum_template_row, 1):
         copy_cell(sum_tmpl_cell, ws.cell(row=sum_row_idx, column=col))
@@ -392,9 +394,9 @@ def process_dispersion_sheet() -> None:
     
     for i, (idx, row) in enumerate(df_company.iterrows(), 0):
         target_row = 2 + i
-        ws.cell(row=target_row, column=1, value=str(row['得意先CD']))
-        ws.cell(row=target_row, column=3, value=str(row['得意先']))
-        ws.cell(row=target_row, column=4, value=float(row['今回請求額']))
+        ws.cell(row=target_row, column=1, value=str(row[COL_CUSTOMER_CODE]))
+        ws.cell(row=target_row, column=3, value=str(row[COL_CUSTOMER_NAME]))
+        ws.cell(row=target_row, column=4, value=float(row[COL_SALES_AMOUNT]))
         ws.cell(row=target_row, column=kei_col, value=f'=SUM(E{target_row}:{kei_prev_letter}{target_row})')
         ws.cell(row=target_row, column=sagi_col, value=f'=D{target_row}-{kei_letter}{target_row}')
     
@@ -415,7 +417,7 @@ def process_dispersion_sheet() -> None:
     first_group_processed = False
     for i, (idx, row) in enumerate(df_company.iterrows(), 0):
         target_row = 2 + i
-        group = row['所属グループ']
+        group = row[COL_GROUP_NAME]
         
         if group != current_group:
             current_group = group
@@ -480,8 +482,8 @@ def format_monthly_sales_sheet() -> None:
     wb = load_workbook(OUTPUT_FILE)
     ws = wb[YYMM]
     df = pd.read_excel(OUTPUT_FILE, sheet_name=YYMM, engine='openpyxl')
-    total_row = df[df.iloc[:, 0] == '合計']
-    data_df = df[df.iloc[:, 0] != '合計'].copy()
+    total_row = df[df.iloc[:, 0] == COL_TOTAL_LABEL]
+    data_df = df[df.iloc[:, 0] != COL_TOTAL_LABEL].copy()
     data_df['順位'] = range(1, len(data_df) + 1)
     data_df = data_df[['順位', data_df.columns[0], data_df.columns[1]]]
     ws['A1'] = f'{YYMM}月分'
@@ -782,9 +784,9 @@ def write_all_sheets_with_pandas(all_df, group_sum):
         all_df_sorted = all_df.copy()
         group_order = group_sum[group_sum['グループ名'] != '合計']['グループ名'].tolist()
         group_rank = {g: i for i, g in enumerate(group_order)}
-        all_df_sorted['グループ売上順位'] = all_df_sorted['所属グループ'].map(group_rank).fillna(len(group_order))
-        all_df_sorted = all_df_sorted.sort_values(['グループ売上順位', '今回請求額'], ascending=[True, False])
-        all_df_sorted['今回請求額'] = pd.to_numeric(all_df_sorted['今回請求額'], errors='coerce')
+        all_df_sorted['グループ売上順位'] = all_df_sorted[COL_GROUP_NAME].map(group_rank).fillna(len(group_order))
+        all_df_sorted = all_df_sorted.sort_values(['グループ売上順位', COL_SALES_AMOUNT], ascending=[True, False])
+        all_df_sorted[COL_SALES_AMOUNT] = pd.to_numeric(all_df_sorted[COL_SALES_AMOUNT], errors='coerce')
         all_df_sorted.drop(columns=['グループ売上順位']).to_excel(writer, index=False, sheet_name=SHEET_COMPANY)
     # 連結シート色付け
     from openpyxl import load_workbook
@@ -798,7 +800,7 @@ def main() -> None:
     setup_logging()
     logger.info("=== 売上データ自動処理スクリプト開始 ===")
     try:
-        global YYMM, PREV_YYMM, LAST_MONTH_YYMM, TEMPLATE_SHEETS, SALES_DB_SHEETS
+        global YYMM, PREV_YYMM, LAST_MONTH_YYMM, TEMPLATE_SHEETS, SALES_DB_SHEETS, OUTPUT_FILE
         YYMM = input('何年何月分のデータですか？(例:2025年05月→2505): ').strip()
         if not YYMM.isdigit() or len(YYMM) != 4:
             logger.error(f"不正なYYMM形式: {YYMM}")
@@ -808,6 +810,11 @@ def main() -> None:
         LAST_MONTH_YYMM = get_last_month_yymm(YYMM)
         TEMPLATE_SHEETS = [f'{YYMM}{SHEET_DISPERSION}', f'{YYMM}{SHEET_GROUP_RANK}']
         SALES_DB_SHEETS = [PREV_YYMM, LAST_MONTH_YYMM]
+        # ここでOUTPUT_FILEの先頭にYYMMを付与
+        import os
+        base_dir = os.path.dirname(config['output']['file'])
+        base_name = os.path.basename(config['output']['file'])
+        OUTPUT_FILE = os.path.join(base_dir, f"{YYMM}_{base_name}") if base_dir else f"{YYMM}_{base_name}"
         logger.info(f"処理対象: YYMM={YYMM} 前年={PREV_YYMM} 先月={LAST_MONTH_YYMM}")
         print(f"[INFO] YYMM={YYMM} 前年={PREV_YYMM} 先月={LAST_MONTH_YYMM} で処理を開始します")
         logger.info("データ前処理開始")
@@ -822,13 +829,13 @@ def main() -> None:
         all_df = merge_with_master(all_df)
         print("[OK] マスタマージ・整形 完了")
         logger.info("グループ合計計算開始")
-        group_sum = all_df.groupby('所属グループ', dropna=False)['今回請求額'].sum().reset_index()
-        group_sum = group_sum.rename(columns={'所属グループ': 'グループ名', '今回請求額': '合計売上'})
-        group_sum = group_sum.sort_values('合計売上', ascending=False)
-        total = group_sum['合計売上'].sum()
-        total_row = pd.DataFrame({'グループ名': ['合計'], '合計売上': [total]})
+        group_sum = all_df.groupby(COL_GROUP_NAME, dropna=False)[COL_SALES_AMOUNT].sum().reset_index()
+        group_sum = group_sum.rename(columns={COL_GROUP_NAME: COL_GROUP_LABEL, COL_SALES_AMOUNT: COL_TOTAL_SALES})
+        group_sum = group_sum.sort_values(COL_TOTAL_SALES, ascending=False)
+        total = group_sum[COL_TOTAL_SALES].sum()
+        total_row = pd.DataFrame({COL_GROUP_LABEL: [COL_TOTAL_LABEL], COL_TOTAL_SALES: [total]})
         group_sum = pd.concat([group_sum, total_row], ignore_index=True)
-        group_sum['合計売上'] = pd.to_numeric(group_sum['合計売上'], errors='coerce')
+        group_sum[COL_TOTAL_SALES] = pd.to_numeric(group_sum[COL_TOTAL_SALES], errors='coerce')
         print("[OK] グループ合計出力 完了")
         # pandasで全シート書き出し
         write_all_sheets_with_pandas(all_df, group_sum)
