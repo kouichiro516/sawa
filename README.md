@@ -1,2 +1,4 @@
 hello
 goodbye
+say
+bye
